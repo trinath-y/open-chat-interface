@@ -660,7 +660,7 @@
                     break;
 
                 case 'tool.start':
-                    addToolExecution(`🔧 Using tool: ${event.data.name || 'unknown'}`);
+                    addToolExecution(`🔧 Using tool: ${event.data.tool_name || 'unknown'}`);
                     break;
 
                 case 'message.complete':

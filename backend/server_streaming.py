@@ -25,103 +25,244 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 class StreamingClaudeInterface:
-    """Real-time streaming interface with Claude CLI"""
+    """Real-time streaming interface with Claude CLI using stream-json format"""
 
     def __init__(self):
         self.claude_command = os.getenv('CLAUDE_COMMAND', 'claude')
         self.process = None
-        self.is_ready = False
+        self.current_tools = {}  # Track active tools
+        self.session_id = None
 
-    async def start_interactive_session(self):
-        """Start an interactive Claude session"""
-        # Start Claude in interactive mode (no --print flag!)
-        self.process = await asyncio.create_subprocess_exec(
+    async def send_message_streaming(self, content: str):
+        """Send message using stream-json format for real-time streaming"""
+        start_time = time.time()
+
+        # Build Claude command with required streaming flags (verbose is required for stream-json)
+        cmd = [
             self.claude_command,
-            stdin=asyncio.subprocess.PIPE,
+            '--output-format', 'stream-json',
+            '--include-partial-messages',
+            '--verbose',
+            content
+        ]
+
+        logger.info(f"Starting Claude with stream-json: {' '.join(cmd[:3])}...")
+
+        # Start the process
+        self.process = await asyncio.create_subprocess_exec(
+            *cmd,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
             bufsize=0  # Unbuffered for real-time
         )
 
-        # Wait for initial prompt
-        await self.wait_for_ready()
-        self.is_ready = True
-        logger.info("Claude interactive session started")
-
-    async def wait_for_ready(self):
-        """Wait for Claude to be ready"""
-        # Read initial output until we see a prompt
+        # Process the stream
         buffer = ""
-        while True:
-            try:
+        first_content = True
+
+        try:
+            while True:
+                # Read larger chunks for better performance
                 chunk = await asyncio.wait_for(
-                    self.process.stdout.read(1024),
-                    timeout=0.5
-                )
-                if chunk:
-                    buffer += chunk.decode('utf-8', errors='ignore')
-                    # Look for prompt indicators
-                    if ">" in buffer or ":" in buffer or len(buffer) > 100:
-                        break
-            except asyncio.TimeoutError:
-                break
-
-    async def send_message_streaming(self, content: str):
-        """Send message and stream response in real-time"""
-        if not self.is_ready:
-            await self.start_interactive_session()
-
-        start_time = time.time()
-
-        # Send the message
-        self.process.stdin.write((content + "\n").encode())
-        await self.process.stdin.drain()
-
-        # Stream the response
-        response_buffer = ""
-        last_chunk_time = time.time()
-
-        while True:
-            try:
-                # Read small chunks for real-time streaming
-                chunk = await asyncio.wait_for(
-                    self.process.stdout.read(64),  # Small chunks for responsiveness
-                    timeout=0.3
+                    self.process.stdout.read(8192),
+                    timeout=30.0  # 30 second timeout
                 )
 
-                if chunk:
-                    text = chunk.decode('utf-8', errors='ignore')
-                    response_buffer += text
-                    last_chunk_time = time.time()
-
-                    # Yield each chunk immediately
-                    yield {
-                        'type': 'chunk',
-                        'content': text,
-                        'timestamp': time.time() - start_time
-                    }
-
-                    # Check if response seems complete (basic heuristic)
-                    if text.endswith('\n\n') or text.endswith('.\n'):
-                        await asyncio.sleep(0.2)  # Brief pause to check for more
-
-            except asyncio.TimeoutError:
-                # If no data for 0.3 seconds, check if we should stop
-                if time.time() - last_chunk_time > 1.0:  # 1 second of silence
+                if not chunk:
                     break
 
-        # Final event
+                buffer += chunk.decode('utf-8', errors='ignore')
+
+                # Process complete lines
+                while '\n' in buffer:
+                    line, buffer = buffer.split('\n', 1)
+                    if line.strip():
+                        try:
+                            event_data = json.loads(line.strip())
+
+                            # Process the event
+                            async for result in self._process_event(event_data, start_time, first_content):
+                                yield result
+                                if result.get('type') == 'content_delta':
+                                    first_content = False
+
+                        except json.JSONDecodeError:
+                            # Skip invalid JSON lines
+                            continue
+
+        except asyncio.TimeoutError:
+            logger.warning("Claude process timed out")
+        except Exception as e:
+            logger.error(f"Error processing Claude stream: {e}")
+            yield {
+                'type': 'error',
+                'content': str(e),
+                'timestamp': time.time() - start_time
+            }
+        finally:
+            # Cleanup - suppress errors during normal termination
+            if self.process:
+                try:
+                    self.process.terminate()
+                    await asyncio.wait_for(self.process.wait(), timeout=3.0)
+                except asyncio.TimeoutError:
+                    # Only log if process won't terminate gracefully
+                    logger.warning("Claude process didn't terminate gracefully, killing...")
+                    self.process.kill()
+                except Exception:
+                    # Don't log normal cleanup errors
+                    pass
+
+        # Final completion event
         yield {
             'type': 'complete',
-            'total_time': time.time() - start_time,
-            'content': response_buffer
+            'total_time': time.time() - start_time
         }
+
+    async def _process_event(self, event_data: Dict[str, Any], start_time: float, first_content: bool):
+        """Process individual stream-json events"""
+        event_type = event_data.get('type')
+        timestamp = time.time() - start_time
+
+        if event_type == 'system':
+            # System initialization
+            self.session_id = event_data.get('session_id')
+            yield {
+                'type': 'system',
+                'session_id': self.session_id,
+                'tools': event_data.get('tools', []),
+                'model': event_data.get('model'),
+                'timestamp': timestamp
+            }
+
+        elif event_type == 'stream_event':
+            # Extract the nested event
+            nested_event = event_data.get('event', {})
+            nested_type = nested_event.get('type')
+
+            if nested_type == 'message_start':
+                message = nested_event.get('message', {})
+                yield {
+                    'type': 'message_start',
+                    'message_id': message.get('id'),
+                    'model': message.get('model'),
+                    'timestamp': timestamp
+                }
+
+            elif nested_type == 'content_block_start':
+                content_block = nested_event.get('content_block', {})
+                block_type = content_block.get('type')
+
+                if block_type == 'tool_use':
+                    tool_id = content_block.get('id')
+                    tool_name = content_block.get('name')
+
+                    # Track this tool
+                    self.current_tools[tool_id] = {
+                        'name': tool_name,
+                        'input': {},
+                        'partial_input': ''
+                    }
+
+                    yield {
+                        'type': 'tool_start',
+                        'tool_id': tool_id,
+                        'tool_name': tool_name,
+                        'timestamp': timestamp
+                    }
+
+            elif nested_type == 'content_block_delta':
+                delta = nested_event.get('delta', {})
+                delta_type = delta.get('type')
+
+                if delta_type == 'text_delta':
+                    text = delta.get('text', '')
+                    yield {
+                        'type': 'content_delta',
+                        'content': text,
+                        'timestamp': timestamp,
+                        'first_chunk': first_content
+                    }
+
+                elif delta_type == 'input_json_delta':
+                    # Tool input being built
+                    index = nested_event.get('index', 0)
+                    partial_json = delta.get('partial_json', '')
+
+                    # Find the tool being updated
+                    for tool_id, tool_info in self.current_tools.items():
+                        if index == 1:  # Tool use blocks are typically at index 1
+                            tool_info['partial_input'] += partial_json
+
+                            # Try to parse complete input
+                            try:
+                                if tool_info['partial_input'].endswith('}'):
+                                    tool_info['input'] = json.loads(tool_info['partial_input'])
+                            except:
+                                pass
+
+                            yield {
+                                'type': 'tool_input_delta',
+                                'tool_id': tool_id,
+                                'tool_name': tool_info['name'],
+                                'partial_input': tool_info['partial_input'],
+                                'complete_input': tool_info.get('input'),
+                                'timestamp': timestamp
+                            }
+                            break
+
+            elif nested_type == 'content_block_stop':
+                index = nested_event.get('index', 0)
+                if index == 1:  # Tool block completed
+                    yield {
+                        'type': 'tool_complete',
+                        'timestamp': timestamp
+                    }
+
+            elif nested_type == 'message_stop':
+                yield {
+                    'type': 'message_stop',
+                    'timestamp': timestamp
+                }
+
+        elif event_type == 'user':
+            # Tool result
+            message = event_data.get('message', {})
+            content = message.get('content', [])
+
+            for content_item in content:
+                if content_item.get('type') == 'tool_result':
+                    tool_use_id = content_item.get('tool_use_id')
+                    result_content = content_item.get('content', '')
+                    is_error = content_item.get('is_error', False)
+
+                    yield {
+                        'type': 'tool_result',
+                        'tool_id': tool_use_id,
+                        'content': result_content,
+                        'is_error': is_error,
+                        'timestamp': timestamp
+                    }
+
+        elif event_type == 'result':
+            # Final result
+            yield {
+                'type': 'final_result',
+                'result': event_data.get('result'),
+                'duration_ms': event_data.get('duration_ms'),
+                'cost_usd': event_data.get('total_cost_usd'),
+                'timestamp': timestamp
+            }
 
     async def cleanup(self):
         """Clean up the process"""
         if self.process:
-            self.process.terminate()
-            await self.process.wait()
+            try:
+                self.process.terminate()
+                await asyncio.wait_for(self.process.wait(), timeout=3.0)
+            except Exception:
+                # Suppress cleanup errors during session cleanup
+                pass
 
 class StreamingChatServer:
     """Real-time streaming web server"""
@@ -204,36 +345,110 @@ class StreamingChatServer:
                     'data': {'id': message_id}
                 }, to=sid)
 
-                # Stream the response
+                # Stream the response with proper event handling
                 first_chunk = True
+                current_tool_name = None
+
                 async for event in claude.send_message_streaming(content):
-                    if event['type'] == 'chunk':
-                        # Send each chunk immediately
+                    event_type = event.get('type')
+
+                    if event_type == 'system':
+                        await self.sio.emit('stream_event', {
+                            'type': 'system.init',
+                            'data': {
+                                'session_id': event.get('session_id'),
+                                'model': event.get('model'),
+                                'tools': len(event.get('tools', []))
+                            }
+                        }, to=sid)
+
+                    elif event_type == 'message_start':
+                        await self.sio.emit('stream_event', {
+                            'type': 'message.start',
+                            'data': {
+                                'message_id': event.get('message_id'),
+                                'model': event.get('model')
+                            }
+                        }, to=sid)
+
+                    elif event_type == 'content_delta':
+                        # Text content streaming
                         await self.sio.emit('stream_event', {
                             'type': 'message.delta',
-                            'data': {'content': event['content']}
+                            'data': {'content': event.get('content', '')}
                         }, to=sid)
 
                         if first_chunk:
                             logger.info(f"First chunk in {event['timestamp']:.2f}s")
                             first_chunk = False
 
-                    elif event['type'] == 'complete':
-                        # Send complete event
+                    elif event_type == 'tool_start':
+                        current_tool_name = event.get('tool_name')
                         await self.sio.emit('stream_event', {
-                            'type': 'message.complete',
+                            'type': 'tool.start',
                             'data': {
-                                'response_time': event['total_time']
+                                'tool_id': event.get('tool_id'),
+                                'tool_name': current_tool_name
+                            }
+                        }, to=sid)
+                        logger.info(f"Tool started: {current_tool_name}")
+
+                    elif event_type == 'tool_input_delta':
+                        # Show tool parameters being built
+                        await self.sio.emit('stream_event', {
+                            'type': 'tool.input_building',
+                            'data': {
+                                'tool_id': event.get('tool_id'),
+                                'tool_name': event.get('tool_name'),
+                                'partial_input': event.get('partial_input'),
+                                'complete_input': event.get('complete_input')
                             }
                         }, to=sid)
 
-                        logger.info(f"Response completed in {event['total_time']:.2f}s")
+                    elif event_type == 'tool_result':
+                        # Tool execution result
+                        await self.sio.emit('stream_event', {
+                            'type': 'tool.result',
+                            'data': {
+                                'tool_id': event.get('tool_id'),
+                                'content': event.get('content'),
+                                'is_error': event.get('is_error', False)
+                            }
+                        }, to=sid)
+                        logger.info(f"Tool result received for {current_tool_name}")
+
+                    elif event_type == 'message_stop':
+                        await self.sio.emit('stream_event', {
+                            'type': 'message.stop',
+                            'data': {}
+                        }, to=sid)
+
+                    elif event_type == 'complete':
+                        # Send complete event
+                        await self.sio.emit('stream_event', {
+                            'type': 'session.complete',
+                            'data': {
+                                'total_time': event.get('total_time')
+                            }
+                        }, to=sid)
+                        logger.info(f"Response completed in {event.get('total_time', 0):.2f}s")
+
+                    elif event_type == 'error':
+                        await self.sio.emit('stream_event', {
+                            'type': 'error',
+                            'data': {
+                                'message': event.get('content', 'Unknown error')
+                            }
+                        }, to=sid)
+                        logger.error(f"Error in stream: {event.get('content')}")
 
                 # End streaming
                 await self.sio.emit('stream_end', {}, to=sid)
 
             except Exception as e:
-                logger.error(f"Error handling message: {e}")
+                # Only log actual errors, not normal completion
+                if "normal completion" not in str(e).lower():
+                    logger.error(f"Error handling message: {e}")
                 await self.sio.emit('error', {
                     'message': str(e)
                 }, to=sid)
@@ -264,12 +479,13 @@ class StreamingChatServer:
 
         print(f"""
 ╔════════════════════════════════════════════════════════╗
-║     Claude Direct Interface - REAL-TIME STREAMING      ║
+║     Claude Direct Interface - STREAM-JSON MODE         ║
 ╠════════════════════════════════════════════════════════╣
 ║                                                        ║
 ║  🌐 URL:  http://localhost:{self.port:<5}                        ║
-║  ⚡ Mode: Real-time streaming (Interactive)           ║
-║  🚀 First byte: <1 second                             ║
+║  ⚡ Mode: Stream-JSON with tool visibility            ║
+║  🚀 First byte: <1 second (FIXED!)                   ║
+║  🔧 Tools: Bash, Read, Edit, Write visible           ║
 ║                                                        ║
 ║  ✅ Server is running! Open the URL in your browser.   ║
 ║                                                        ║
