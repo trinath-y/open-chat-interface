@@ -1,0 +1,14 @@
+# Claude Direct Interface - Backend Requirements
+# Python 3.8+ required
+
+# Core web framework
+aiohttp>=3.8.0
+
+# WebSocket/SocketIO support
+python-socketio>=5.9.0
+
+# Async support
+aiofiles>=23.0.0
+
+# Optional: For better performance
+uvloop>=0.17.0 ; sys_platform != 'win32'
