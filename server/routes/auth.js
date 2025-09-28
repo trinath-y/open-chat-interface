@@ -75,6 +75,9 @@ router.get('/claude', (req, res) => {
       refreshToken: 'demo_refresh_token'
     };
     
+    // Store demo user in session
+    req.session.demoUser = demoUser;
+    
     req.login(demoUser, (err) => {
       if (err) {
         return res.redirect(`${process.env.CLIENT_URL || 'http://localhost:3000'}?auth=failure`);
@@ -104,13 +107,14 @@ router.get('/failure', (req, res) => {
 });
 
 router.get('/user', (req, res) => {
-  if (req.user) {
+  if (req.user || req.session.demoUser) {
+    const user = req.user || req.session.demoUser;
     res.json({
       authenticated: true,
       user: {
-        id: req.user.id,
-        email: req.user.email,
-        plan: req.user.plan
+        id: user.id,
+        email: user.email,
+        plan: user.plan
       }
     });
   } else {

@@ -5,8 +5,12 @@ const router = express.Router();
 
 // Middleware to check authentication
 const requireAuth = (req, res, next) => {
-  if (!req.user) {
+  if (!req.user && !req.session.demoUser) {
     return res.status(401).json({ error: 'Authentication required' });
+  }
+  // If no real user but we have a demo user, use it
+  if (!req.user && req.session.demoUser) {
+    req.user = req.session.demoUser;
   }
   next();
 };
