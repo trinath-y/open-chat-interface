@@ -10,10 +10,13 @@ Open Chat Interface provides a web-based UI for interacting with Claude using yo
 
 - **No API Keys Required**: Uses your existing Claude CLI authentication (Claude Pro/Max)
 - **Real-time Streaming**: See Claude's responses character-by-character as they're generated
+- **Tool Visibility**: Watch Claude use tools (Bash, Read, Edit, Write) in real-time
+- **Agentic Interface**: Full transparency into what Claude is doing
 - **Session Management**: Maintains conversation context across messages
 - **Markdown Support**: Full markdown rendering with syntax highlighting
 - **Clean UI**: Modern, responsive interface optimized for conversation
 - **Local Only**: Everything runs on your machine - no external API calls
+- **Optimized Performance**: ~7 second response time (Claude CLI baseline)
 
 ## 📋 Prerequisites
 
@@ -69,13 +72,16 @@ Navigate to `http://localhost:3000` in your web browser and start chatting!
 ```
 open-chat-interface/
 ├── backend/
-│   ├── server.py           # Python server that interfaces with Claude CLI
-│   └── requirements.txt    # Python dependencies
+│   ├── server.py           # Streaming server with tool visibility
+│   ├── requirements.txt    # Python dependencies
+│   └── archive/           # Previous implementations (for reference)
+│       ├── server_original.py  # Original JSON mode (45-53s)
+│       └── server_fast.py      # Plain text mode (11-16s)
 ├── frontend/
-│   └── index.html         # Web interface with WebSocket client
+│   └── index.html         # Web interface with real-time updates
 ├── .claude/
 │   └── commands/
-│       └── agentic-todo.md # Future enhancement plans
+│       └── agentic-todo.md # Enhancement roadmap
 └── README.md              # This file
 ```
 
